@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import html
@@ -42,8 +43,10 @@ state = {
     "ticker_alerts": {},
     "ticker_cooldowns": {},
     "bypasses": {},
+    "watchlist": [],
     "stats": {
         "tiktok_found": 0,
+        "watch_hits": 0,
         "pair_suppressed": 0,
         "ticker_suppressed": 0,
         "bypassed": 0,
@@ -91,6 +94,34 @@ def ticker_key(symbol):
     return norm(symbol)
 
 
+def match_text(name, symbol):
+    return (str(name or "") + " " + str(symbol or "")).lower()
+
+
+def phrase_matches(phrase, text):
+    phrase = norm(phrase)
+    text = norm(text)
+
+    if not phrase or not text:
+        return False
+
+    # Whole-word-ish matching:
+    # /watch bro matches "bro" or "bro coin"
+    # but does NOT match "lebron" or "brother".
+    pattern = r"(?<![a-zA-Z0-9])" + re.escape(phrase) + r"(?![a-zA-Z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def matched_watch_phrase(name, symbol):
+    text = match_text(name, symbol)
+
+    for phrase in state.get("watchlist", []):
+        if phrase_matches(phrase, text):
+            return phrase
+
+    return None
+
+
 def stat_inc(key, amount=1):
     state.setdefault("stats", {})
     state["stats"][key] = int(state["stats"].get(key, 0)) + amount
@@ -109,10 +140,12 @@ def load_state():
     state.setdefault("ticker_alerts", {})
     state.setdefault("ticker_cooldowns", {})
     state.setdefault("bypasses", {})
+    state.setdefault("watchlist", [])
     state.setdefault("stats", {})
 
     for key in [
         "tiktok_found",
+        "watch_hits",
         "pair_suppressed",
         "ticker_suppressed",
         "bypassed",
@@ -293,13 +326,11 @@ def clean_old_state():
         if now < float(v)
     }
 
-    # ticker_alerts reset only when cooldown starts, or if older than 24h.
     state["ticker_alerts"] = {
         k: v for k, v in state.get("ticker_alerts", {}).items()
         if now - float(v.get("first_seen", now)) < TICKER_COOLDOWN_SECONDS
     }
 
-    # bypasses stay until removed manually.
     save_state()
 
 
@@ -324,6 +355,11 @@ def should_alert(name, symbol):
     pkey = pair_key(name, symbol)
     skey = ticker_key(symbol)
     now = time.time()
+
+    watch_phrase = matched_watch_phrase(name, symbol)
+    if watch_phrase:
+        stat_inc("watch_hits")
+        return True, "watchlist: " + watch_phrase
 
     bypassed, reason = is_bypassed(name, symbol)
     if bypassed:
@@ -398,6 +434,9 @@ def send_tiktok_alert(coin, mint, tiktok, allow_reason):
         + "🚀 <b>Pump.fun:</b>" + n() + pump + n() + n()
         + "🧬 <b>CA:</b>" + n() + "<code>" + esc(mint) + "</code>"
     )
+
+    if allow_reason.startswith("watchlist:"):
+        caption += n() + n() + "👁 <b>Watchlist:</b> " + esc(allow_reason.replace("watchlist:", "").strip())
 
     if "bypass" in allow_reason:
         caption += n() + n() + "🟢 <b>Bypass:</b> " + esc(allow_reason)
@@ -483,6 +522,7 @@ def status_text():
         + "👀 <b>Tokens seen:</b> " + str(tokens_seen) + n()
         + "🎵 <b>TikTok found:</b> " + str(stats.get("tiktok_found", 0)) + n()
         + "🚨 <b>Alerts sent:</b> " + str(alerts_sent) + n()
+        + "👁 <b>Watchlist hits:</b> " + str(stats.get("watch_hits", 0)) + n()
         + "🔁 <b>Pair suppressed:</b> " + str(stats.get("pair_suppressed", 0)) + n()
         + "🏷 <b>Ticker suppressed:</b> " + str(stats.get("ticker_suppressed", 0)) + n()
         + "🟢 <b>Bypassed:</b> " + str(stats.get("bypassed", 0)) + n()
@@ -492,6 +532,20 @@ def status_text():
         + "📣 <b>Last alert:</b> " + esc(last_alert) + n()
         + "🕒 <b>Checked:</b> " + now_utc()
     )
+
+
+def watchlist_text():
+    watchlist = state.get("watchlist", [])
+
+    if not watchlist:
+        return "👁 Watchlist is empty."
+
+    lines = ["👁 <b>Watchlist</b>", ""]
+
+    for phrase in sorted(watchlist):
+        lines.append("• <code>" + esc(phrase) + "</code>")
+
+    return n().join(lines)
 
 
 def bypasses_text():
@@ -558,6 +612,37 @@ def command_loop():
                 elif lower in ["/bypasses", "bypasses"]:
                     tg(bypasses_text())
 
+                elif lower in ["/watchlist", "watchlist"]:
+                    tg(watchlist_text())
+
+                elif lower.startswith("/watch "):
+                    phrase = text.split(" ", 1)[1].strip().lower()
+
+                    if not phrase:
+                        tg("Use it like:" + n() + "<code>/watch bro</code>")
+                        continue
+
+                    if phrase not in state["watchlist"]:
+                        state["watchlist"].append(phrase)
+                        state["watchlist"] = sorted(list(set(state["watchlist"])))
+                        save_state()
+
+                    tg(
+                        "👁 Watching name/ticker phrase:" + n()
+                        + "<code>" + esc(phrase) + "</code>" + n() + n()
+                        + "Whole-word matching is ON."
+                    )
+
+                elif lower.startswith("/unwatch "):
+                    phrase = text.split(" ", 1)[1].strip().lower()
+
+                    if phrase in state["watchlist"]:
+                        state["watchlist"].remove(phrase)
+                        save_state()
+                        tg("🗑 Removed watch phrase:" + n() + "<code>" + esc(phrase) + "</code>")
+                    else:
+                        tg("That phrase is not in the watchlist.")
+
                 elif lower.startswith("/bypass "):
                     raw = text.split(" ", 1)[1].strip()
                     parts = raw.split("|")
@@ -601,6 +686,9 @@ def command_loop():
                     tg(
                         "🤖 <b>Commands</b>" + n() + n()
                         + "/status - health check" + n()
+                        + "/watch phrase - alert matching TikTok launches" + n()
+                        + "/unwatch phrase - remove watch phrase" + n()
+                        + "/watchlist - show watched phrases" + n()
                         + "/cooldowns - show active ticker cooldowns" + n()
                         + "/bypasses - show active bypasses" + n()
                         + "/bypass TICKER - bypass ticker cooldowns" + n()
