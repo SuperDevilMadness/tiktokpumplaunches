@@ -1,0 +1,16 @@
+services:
+  pumpfun-tiktok-agent:
+    build: .
+    container_name: pumpfun-tiktok-agent
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    volumes:
+      - pumpfun_tiktok_data:/data
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      HEARTBEAT_MINUTES: ${HEARTBEAT_MINUTES}
+
+volumes:
+  pumpfun_tiktok_data:
