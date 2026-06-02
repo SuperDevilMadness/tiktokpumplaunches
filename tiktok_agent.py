@@ -35,8 +35,8 @@ tokens_seen = 0
 alerts_sent = 0
 last_coin = "None yet"
 last_alert = "None yet"
-
 seen_mints = set()
+rate_limited_until = 0
 
 state = {
     "pair_alerts": {},
@@ -50,12 +50,11 @@ state = {
         "pair_suppressed": 0,
         "ticker_suppressed": 0,
         "bypassed": 0,
+        "forcechecks": 0,
         "fetch_errors": 0,
         "fetch_429s": 0,
     }
 }
-
-rate_limited_until = 0
 
 
 def n():
@@ -71,8 +70,8 @@ def now_utc():
 
 
 def uptime():
-    s = int(time.time() - start_time)
-    return f"{s // 3600} hr {(s % 3600) // 60} min"
+    seconds = int(time.time() - start_time)
+    return f"{seconds // 3600} hr {(seconds % 3600) // 60} min"
 
 
 def money(x):
@@ -105,9 +104,6 @@ def phrase_matches(phrase, text):
     if not phrase or not text:
         return False
 
-    # Whole-word-ish matching:
-    # /watch bro matches "bro" or "bro coin"
-    # but does NOT match "lebron" or "brother".
     pattern = r"(?<![a-zA-Z0-9])" + re.escape(phrase) + r"(?![a-zA-Z0-9])"
     return re.search(pattern, text) is not None
 
@@ -149,6 +145,7 @@ def load_state():
         "pair_suppressed",
         "ticker_suppressed",
         "bypassed",
+        "forcechecks",
         "fetch_errors",
         "fetch_429s",
     ]:
@@ -256,10 +253,10 @@ def tg_photo(img, caption):
         print("telegram photo error", e, flush=True)
 
 
-def fetch_coin(mint):
+def fetch_coin(mint, ignore_rate_limit=False):
     global rate_limited_until
 
-    if time.time() < rate_limited_until:
+    if not ignore_rate_limit and time.time() < rate_limited_until:
         return None
 
     try:
@@ -289,8 +286,8 @@ def fetch_coin(mint):
             save_state()
             return None
 
-        d = r.json()
-        return d.get("data", d)
+        data = r.json()
+        return data.get("data", data)
 
     except Exception as e:
         stat_inc("fetch_errors")
@@ -366,14 +363,12 @@ def should_alert(name, symbol):
         stat_inc("bypassed")
         return True, reason
 
-    # Exact same name+ticker: max once per 48 hours.
     if pkey in state["pair_alerts"]:
         if now - float(state["pair_alerts"][pkey]) < PAIR_COOLDOWN_SECONDS:
             stat_inc("pair_suppressed")
             save_state()
             return False, "same name+ticker suppressed"
 
-    # Same ticker: max 4 alerts, then ticker cooldown 24 hours.
     if skey in state["ticker_cooldowns"] and now < float(state["ticker_cooldowns"][skey]):
         stat_inc("ticker_suppressed")
         save_state()
@@ -441,6 +436,9 @@ def send_tiktok_alert(coin, mint, tiktok, allow_reason):
     if "bypass" in allow_reason:
         caption += n() + n() + "🟢 <b>Bypass:</b> " + esc(allow_reason)
 
+    if "forcecheck" in allow_reason:
+        caption += n() + n() + "🧪 <b>Manual forcecheck</b>"
+
     tg_photo(image, caption)
     last_alert = f"{name} / {symbol}"
 
@@ -452,8 +450,7 @@ def check_coin(mint, delay):
     if not coin:
         return
 
-    text = json.dumps(coin)
-    tiktok = find_tiktok(text)
+    tiktok = find_tiktok(json.dumps(coin))
 
     if not tiktok:
         return
@@ -474,7 +471,7 @@ def check_coin(mint, delay):
 
 
 def schedule_checks(mint):
-    for delay in [10, 45, 180, 600]:
+    for delay in [10, 45, 180, 600, 1800]:
         threading.Thread(target=check_coin, args=(mint, delay), daemon=True).start()
 
 
@@ -526,6 +523,7 @@ def status_text():
         + "🔁 <b>Pair suppressed:</b> " + str(stats.get("pair_suppressed", 0)) + n()
         + "🏷 <b>Ticker suppressed:</b> " + str(stats.get("ticker_suppressed", 0)) + n()
         + "🟢 <b>Bypassed:</b> " + str(stats.get("bypassed", 0)) + n()
+        + "🧪 <b>Forcechecks:</b> " + str(stats.get("forcechecks", 0)) + n()
         + "🚧 <b>429s:</b> " + str(stats.get("fetch_429s", 0)) + n()
         + "⚠️ <b>Fetch errors:</b> " + str(stats.get("fetch_errors", 0)) + n() + n()
         + "🪙 <b>Last coin:</b>" + n() + "<code>" + esc(last_coin) + "</code>" + n()
@@ -677,53 +675,54 @@ def command_loop():
                     else:
                         tg("Could not find that bypass.")
 
+                elif lower.startswith("/debug "):
+                    mint = text.split(" ", 1)[1].strip()
+                    coin = fetch_coin(mint, ignore_rate_limit=True)
+
+                    if not coin:
+                        tg("Could not fetch that coin.")
+                        continue
+
+                    name = coin.get("name", "Unknown")
+                    symbol = coin.get("symbol", "Unknown")
+                    tiktok = find_tiktok(json.dumps(coin))
+                    allowed, reason = should_alert(name, symbol)
+
+                    tg(
+                        "🧪 <b>Debug Result</b>" + n() + n()
+                        + "🪙 <b>Name:</b> " + esc(name) + n()
+                        + "🏷 <b>Ticker:</b> " + esc(symbol) + n()
+                        + "🎵 <b>TikTok found:</b> " + ("YES" if tiktok else "NO") + n()
+                        + "🔗 <b>TikTok:</b> " + esc(tiktok or "None") + n()
+                        + "🚦 <b>Would alert:</b> " + ("YES" if allowed else "NO") + n()
+                        + "🧠 <b>Reason:</b> " + esc(reason) + n()
+                        + "🧬 <b>CA:</b>" + n()
+                        + "<code>" + esc(mint) + "</code>"
+                    )
+
+                elif lower.startswith("/forcecheck "):
+                    mint = text.split(" ", 1)[1].strip()
+                    coin = fetch_coin(mint, ignore_rate_limit=True)
+
+                    if not coin:
+                        tg("Could not fetch that coin.")
+                        continue
+
+                    tiktok = find_tiktok(json.dumps(coin))
+
+                    if not tiktok:
+                        tg("No TikTok found in metadata for:" + n() + "<code>" + esc(mint) + "</code>")
+                        continue
+
+                    stat_inc("forcechecks")
+                    send_tiktok_alert(coin, mint, tiktok, "manual forcecheck")
+                    tg("✅ Forcecheck completed.")
+
                 elif lower in ["/restart", "restart"]:
                     tg("♻️ Restarting TikTok agent...")
                     time.sleep(1)
                     os._exit(0)
 
-                elif lower.startswith("/forcecheck "):
-    mint = text.split(" ", 1)[1].strip()
-    coin = fetch_coin(mint)
-
-    if not coin:
-        tg("Could not fetch that coin.")
-        continue
-
-    tiktok = find_tiktok(json.dumps(coin))
-
-    if not tiktok:
-        tg("No TikTok found in metadata for:" + n() + "<code>" + esc(mint) + "</code>")
-        continue
-
-    send_tiktok_alert(coin, mint, tiktok, "manual forcecheck")
-    tg("✅ Forcecheck completed.")
-
-elif lower.startswith("/debug "):
-    mint = text.split(" ", 1)[1].strip()
-    coin = fetch_coin(mint)
-
-    if not coin:
-        tg("Could not fetch that coin.")
-        continue
-
-    name = coin.get("name", "Unknown")
-    symbol = coin.get("symbol", "Unknown")
-    tiktok = find_tiktok(json.dumps(coin))
-    allowed, reason = should_alert(name, symbol)
-
-    tg(
-        "🧪 <b>Debug Result</b>" + n() + n()
-        + "🪙 <b>Name:</b> " + esc(name) + n()
-        + "🏷 <b>Ticker:</b> " + esc(symbol) + n()
-        + "🎵 <b>TikTok found:</b> " + ("YES" if tiktok else "NO") + n()
-        + "🔗 <b>TikTok:</b> " + esc(tiktok or "None") + n()
-        + "🚦 <b>Would alert:</b> " + ("YES" if allowed else "NO") + n()
-        + "🧠 <b>Reason:</b> " + esc(reason) + n()
-        + "🧬 <b>CA:</b>" + n()
-        + "<code>" + esc(mint) + "</code>"
-    )
-                
                 elif lower in ["/help", "help"]:
                     tg(
                         "🤖 <b>Commands</b>" + n() + n()
@@ -737,9 +736,9 @@ elif lower.startswith("/debug "):
                         + "/bypass NAME | TICKER - bypass exact name+ticker cooldowns" + n()
                         + "/unbypass TICKER - remove ticker bypass" + n()
                         + "/unbypass NAME | TICKER - remove exact bypass" + n()
-                        + "/restart - restart bot"
                         + "/debug CA - diagnose missed coin" + n()
                         + "/forcecheck CA - manually check and alert if TikTok exists" + n()
+                        + "/restart - restart bot"
                     )
 
         except Exception as e:
