@@ -474,7 +474,7 @@ def check_coin(mint, delay):
 
 
 def schedule_checks(mint):
-    for delay in [10, 45, 180]:
+    for delay in [10, 45, 180, 600]:
         threading.Thread(target=check_coin, args=(mint, delay), daemon=True).start()
 
 
@@ -682,6 +682,48 @@ def command_loop():
                     time.sleep(1)
                     os._exit(0)
 
+                elif lower.startswith("/forcecheck "):
+    mint = text.split(" ", 1)[1].strip()
+    coin = fetch_coin(mint)
+
+    if not coin:
+        tg("Could not fetch that coin.")
+        continue
+
+    tiktok = find_tiktok(json.dumps(coin))
+
+    if not tiktok:
+        tg("No TikTok found in metadata for:" + n() + "<code>" + esc(mint) + "</code>")
+        continue
+
+    send_tiktok_alert(coin, mint, tiktok, "manual forcecheck")
+    tg("✅ Forcecheck completed.")
+
+elif lower.startswith("/debug "):
+    mint = text.split(" ", 1)[1].strip()
+    coin = fetch_coin(mint)
+
+    if not coin:
+        tg("Could not fetch that coin.")
+        continue
+
+    name = coin.get("name", "Unknown")
+    symbol = coin.get("symbol", "Unknown")
+    tiktok = find_tiktok(json.dumps(coin))
+    allowed, reason = should_alert(name, symbol)
+
+    tg(
+        "🧪 <b>Debug Result</b>" + n() + n()
+        + "🪙 <b>Name:</b> " + esc(name) + n()
+        + "🏷 <b>Ticker:</b> " + esc(symbol) + n()
+        + "🎵 <b>TikTok found:</b> " + ("YES" if tiktok else "NO") + n()
+        + "🔗 <b>TikTok:</b> " + esc(tiktok or "None") + n()
+        + "🚦 <b>Would alert:</b> " + ("YES" if allowed else "NO") + n()
+        + "🧠 <b>Reason:</b> " + esc(reason) + n()
+        + "🧬 <b>CA:</b>" + n()
+        + "<code>" + esc(mint) + "</code>"
+    )
+                
                 elif lower in ["/help", "help"]:
                     tg(
                         "🤖 <b>Commands</b>" + n() + n()
@@ -696,6 +738,8 @@ def command_loop():
                         + "/unbypass TICKER - remove ticker bypass" + n()
                         + "/unbypass NAME | TICKER - remove exact bypass" + n()
                         + "/restart - restart bot"
+                        + "/debug CA - diagnose missed coin" + n()
+                        + "/forcecheck CA - manually check and alert if TikTok exists" + n()
                     )
 
         except Exception as e:
