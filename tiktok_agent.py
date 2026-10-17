@@ -11,7 +11,10 @@ BOT = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 PORT = int(os.getenv('PORT', '3003'))
 HEARTBEAT_MINUTES = max(5, int(os.getenv('HEARTBEAT_MINUTES', '60')))
-WORKERS = max(1, min(12, int(os.getenv('METADATA_WORKERS', '5'))))
+WORKERS = max(1, min(8, int(os.getenv('METADATA_WORKERS', '3'))))
+HOST_INTERVAL = max(0.2, float(os.getenv('HOST_REQUEST_INTERVAL', '2.0')))
+GLOBAL_INTERVAL = max(0.1, float(os.getenv('GLOBAL_REQUEST_INTERVAL', '0.6')))
+MAX_ATTEMPTS = max(3, int(os.getenv('MAX_METADATA_ATTEMPTS', '8')))
 MAX_PENDING = max(1000, int(os.getenv('MAX_PENDING', '12000')))
 PUMPPORTAL_API_KEY = os.getenv('PUMPPORTAL_API_KEY', '').strip()
 DATA = os.getenv('DATA_DIR', '/data')
@@ -44,6 +47,14 @@ DEFAULT_STATS = ('tokens_seen','metadata_ok','metadata_fail','metadata_404','met
                  'pair_suppressed','ticker_suppressed','watch_hits','retries','queue_dropped','non_tiktok',
                  'websocket_reconnects','checks_completed')
 recent = deque(maxlen=10000)
+# These limits are intentionally shared across workers, including metadata retries.
+host_next = {}
+host_strikes = {}
+global_next = 0.0
+metadata_cache = {}  # URI -> (expiry, metadata); cache only successful JSON
+host_throttled = 0
+cache_hits = 0
+
 
 def utc(ts=None):
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -149,25 +160,96 @@ def normalize_uri(raw):
     if parsed.port not in (None,443): return None
     return raw
 
+def metadata_host(uri):
+    normalized = normalize_uri(uri)
+    return (urlparse(normalized).hostname or '').lower() if normalized else ''
+
+def wait_for_slot(host):
+    """Reserve a per-host AND global request slot without holding a lock while waiting."""
+    global global_next
+    with lock:
+        now = time.time()
+        when = max(now, host_next.get(host, 0), global_next)
+        host_next[host] = when + HOST_INTERVAL
+        global_next = when + GLOBAL_INTERVAL
+    delay = when - time.time()
+    if delay > 0:
+        time.sleep(delay)
+
+def throttle_host(host, retry_after=None):
+    """Honor Retry-After, or apply capped exponential backoff with jitter."""
+    global host_throttled
+    with lock:
+        strikes = min(8, host_strikes.get(host, 0) + 1)
+        host_strikes[host] = strikes
+        backoff = min(300, 10 * 2 ** (strikes - 1)) + random.uniform(0, 3)
+        if retry_after is not None:
+            try:
+                backoff = max(backoff, min(900, float(retry_after)))
+            except (ValueError, TypeError):
+                pass
+        host_next[host] = max(host_next.get(host, 0), time.time() + backoff)
+        host_throttled += 1
+    LOG.warning('Metadata host %s rate-limited; waiting about %.0fs', host, backoff)
+
 def fetch_metadata(uri):
-    uri=normalize_uri(uri)
-    if not uri: return None,'invalid_uri'
-    try:
-        # No redirects: prevents fetching internal addresses through redirects.
-        r=requests.get(uri,headers={'Accept':'application/json','User-Agent':'TikTokLaunchRadar/2.0'},
-                       timeout=(4,9),allow_redirects=False)
-        if r.status_code in (301,302,303,307,308):
-            target=requests.compat.urljoin(uri,r.headers.get('Location',''))
-            target=normalize_uri(target)
-            if not target: return None,'invalid_redirect'
-            r=requests.get(target,headers={'Accept':'application/json'},timeout=(4,9),allow_redirects=False)
-        if r.status_code!=200: return None,str(r.status_code)
-        if len(r.content)>500000: return None,'oversized'
-        obj=r.json()
-        if not isinstance(obj,dict): return None,'invalid_json'
-        return obj,'ok'
-    except (requests.RequestException,ValueError) as e:
-        return None,type(e).__name__
+    uri = normalize_uri(uri)
+    if not uri:
+        return None, 'invalid_uri'
+    with lock:
+        cached = metadata_cache.get(uri)
+        if cached and cached[0] > time.time():
+            global cache_hits
+            cache_hits += 1
+            return cached[1], 'cached'
+    target = uri
+    for _ in range(2):
+        host = metadata_host(target)
+        if not host:
+            return None, 'invalid_uri'
+        wait_for_slot(host)
+        try:
+            r = requests.get(target, headers={'Accept':'application/json',
+                             'User-Agent':'TikTokLaunchRadar/3.0'},
+                             timeout=(4, 9), allow_redirects=False, stream=True)
+            try:
+                if r.status_code in (301,302,303,307,308):
+                    redirected = normalize_uri(requests.compat.urljoin(target, r.headers.get('Location','')))
+                    if not redirected:
+                        return None, 'invalid_redirect'
+                    target = redirected
+                    continue
+                if r.status_code == 429:
+                    throttle_host(host, r.headers.get('Retry-After'))
+                    return None, '429'
+                if r.status_code != 200:
+                    return None, str(r.status_code)
+                if int(r.headers.get('Content-Length', 0) or 0) > 500000:
+                    return None, 'oversized'
+                content = bytearray()
+                for chunk in r.iter_content(chunk_size=32768):
+                    content.extend(chunk)
+                    if len(content) > 500000:
+                        return None, 'oversized'
+                obj = json.loads(content)
+                if not isinstance(obj, dict):
+                    return None, 'invalid_json'
+                with lock:
+                    host_strikes[host] = 0
+                    if len(metadata_cache) >= 4000:
+                        # Drop expired entries first, then the oldest insertion.
+                        for k, v in list(metadata_cache.items()):
+                            if v[0] < time.time():
+                                metadata_cache.pop(k, None)
+                        if len(metadata_cache) >= 4000:
+                            metadata_cache.pop(next(iter(metadata_cache)))
+                    metadata_cache[uri] = (time.time() + 1800, obj)
+                return obj, 'ok'
+            finally:
+                r.close()
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as e:
+            return None, type(e).__name__
+    return None, 'redirect_limit'
 
 def record_check(mint, outcome, attempt, detail=''):
     with lock:
@@ -263,10 +345,13 @@ def check(mint,uri,event,attempt):
         elif result.isdigit(): inc('metadata_other_http')
         record_check(mint,'fetch_error',attempt,result)
         # Retry a bounded number of times, including 404 (often indexing delay).
-        if attempt<5:
+        if attempt < MAX_ATTEMPTS:
             inc('retries')
             with lock: inflight.discard(mint)
-            enqueue(mint,uri,event,attempt+1,[0,15,60,180,600][attempt]+random.random()*3)
+            # 429s are already handled by the host limiter. These delays also
+            # spread other transient failures without blocking fresh launches.
+            delay = min(900, 12 * (2 ** (attempt - 1))) + random.uniform(0, 6)
+            enqueue(mint, uri, event, attempt + 1, delay)
         return
     last_success=time.time()
     inc('metadata_ok')
@@ -349,9 +434,10 @@ def diagnostics():
                 f'Last launch: {int(now-last_event)}s ago\n' if last_event else '🔬 <b>Detection diagnostics</b>\nNo launches received this uptime\n') + (
                 f'Last metadata success: {int(now-last_success)}s ago\n' if last_success else 'No successful metadata fetch this uptime\n') + (
                 f'Pending: {q} | Active: {f}\n'
+                f'Rate limiter: {len(host_next)} hosts; {host_throttled} throttles; {cache_hits} cache hits\n'
                 f'Last hour: {len(samples)} checks; {counts.get("tiktok_found",0)} TikTok links; '
                 f'{counts.get("no_tiktok",0)} no TikTok; {counts.get("fetch_error",0)} fetch failures\n'
-                f'Cumulative: {s["tokens_seen"]} launches; {s["metadata_ok"]} metadata successes; '
+                f'Cumulative (includes previous deployments): {s["tokens_seen"]} launches; {s["metadata_ok"]} metadata successes; '
                 f'{s["metadata_404"]} 404s; {s["metadata_429"]} 429s; '
                 f'{s["metadata_403"]} 401/403s; {s["metadata_missing_uri"]} missing URIs; '
                 f'{s["alerts_sent"]} alerts; {s["queue_dropped"]} queue drops\n'
@@ -465,6 +551,14 @@ def monitor():
         if now-last_heartbeat>=HEARTBEAT_MINUTES*60:
             telegram('🟢 <b>Scheduled TikTok Agent Checkup</b>\n\n'+status())
             last_heartbeat=now
+        with lock:
+            for host, deadline in list(host_next.items()):
+                if deadline < now - 3600:
+                    host_next.pop(host, None)
+                    host_strikes.pop(host, None)
+            for uri, (expiry, _) in list(metadata_cache.items()):
+                if expiry < now:
+                    metadata_cache.pop(uri, None)
         prune(); save()
 
 class Health(BaseHTTPRequestHandler):
