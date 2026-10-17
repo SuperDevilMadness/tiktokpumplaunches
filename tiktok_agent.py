@@ -1,771 +1,191 @@
-import os
-import re
-import time
-import json
-import html
-import threading
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+    meta,result=fetch_metadata(uri)
+    if meta is None:
+        inc('metadata_fail')
+        if result=='404': inc('metadata_404')
+        elif result=='429': inc('metadata_429')
+        elif result in ('401','403'): inc('metadata_403')
+        elif result.isdigit(): inc('metadata_other_http')
+        record_check(mint,'fetch_error',attempt,result)
+        # Retry a bounded number of times, including 404 (often indexing delay).
+        if attempt<5:
+            inc('retries')
+            with lock: inflight.discard(mint)
+            enqueue(mint,uri,event,attempt+1,[0,15,60,180,600][attempt]+random.random()*3)
+        return
+    last_success=time.time()
+    inc('metadata_ok')
+    tiktok=extract_tiktok(meta)
+    if tiktok:
+        inc('tiktok_found')
+        record_check(mint,'tiktok_found',attempt,tiktok)
+        alert(mint,event,meta,tiktok)
+    else:
+        inc('non_tiktok')
+        record_check(mint,'no_tiktok',attempt)
 
-import requests
-import websocket
+def scheduler():
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        while True:
+            item=None
+            with lock:
+                if pending and pending[0][0]<=time.time() and len(inflight)<WORKERS:
+                    item=heapq.heappop(pending)
+                    mint=item[2]
+                    pending_ids.discard(mint)
+                    inflight.add(mint)
+            if not item:
+                time.sleep(.15); continue
+            _,_,mint,uri,event,attempt=item
+            def task(m=mint,u=uri,e=event,a=attempt):
+                try: check(m,u,e,a)
+                except Exception: LOG.exception('check failed for %s',m)
+                finally:
+                    with lock: inflight.discard(m)
+            pool.submit(task)
 
-
-def env_int(name, default):
-    value = os.getenv(name)
-    if value is None or str(value).strip() == "":
-        return int(default)
-    return int(value)
-
-
-BOT = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT = str(os.getenv("TELEGRAM_CHAT_ID") or "")
-HEARTBEAT_MINUTES = env_int("HEARTBEAT_MINUTES", 60)
-
-STATE_FILE = "/data/tiktok_agent_state.json"
-OFFSET_FILE = "/data/telegram_offset.json"
-
-PAIR_COOLDOWN_SECONDS = 48 * 60 * 60
-TICKER_COOLDOWN_SECONDS = 24 * 60 * 60
-TICKER_LIMIT = 4
-
-start_time = time.time()
-ws_connected = False
-tokens_seen = 0
-alerts_sent = 0
-last_coin = "None yet"
-last_alert = "None yet"
-seen_mints = set()
-rate_limited_until = 0
-
-state = {
-    "pair_alerts": {},
-    "ticker_alerts": {},
-    "ticker_cooldowns": {},
-    "bypasses": {},
-    "watchlist": [],
-    "stats": {
-        "tiktok_found": 0,
-        "watch_hits": 0,
-        "pair_suppressed": 0,
-        "ticker_suppressed": 0,
-        "bypassed": 0,
-        "forcechecks": 0,
-        "fetch_errors": 0,
-        "fetch_429s": 0,
-    }
-}
-
-
-def n():
-    return "\n"
-
-
-def esc(x):
-    return html.escape(str(x or ""))
-
-
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def uptime():
-    seconds = int(time.time() - start_time)
-    return f"{seconds // 3600} hr {(seconds % 3600) // 60} min"
-
-
-def money(x):
-    try:
-        return "$" + format(float(x), ",.0f")
-    except Exception:
-        return "Unknown"
-
-
-def norm(x):
-    return str(x or "").strip().lower()
-
-
-def pair_key(name, symbol):
-    return norm(name) + "|" + norm(symbol)
-
-
-def ticker_key(symbol):
-    return norm(symbol)
-
-
-def match_text(name, symbol):
-    return (str(name or "") + " " + str(symbol or "")).lower()
-
-
-def phrase_matches(phrase, text):
-    phrase = norm(phrase)
-    text = norm(text)
-
-    if not phrase or not text:
-        return False
-
-    pattern = r"(?<![a-zA-Z0-9])" + re.escape(phrase) + r"(?![a-zA-Z0-9])"
-    return re.search(pattern, text) is not None
-
-
-def matched_watch_phrase(name, symbol):
-    text = match_text(name, symbol)
-
-    for phrase in state.get("watchlist", []):
-        if phrase_matches(phrase, text):
-            return phrase
-
-    return None
-
-
-def stat_inc(key, amount=1):
-    state.setdefault("stats", {})
-    state["stats"][key] = int(state["stats"].get(key, 0)) + amount
-
-
-def load_state():
-    global state
-    try:
-        with open(STATE_FILE, "r") as f:
-            loaded = json.load(f)
-            state.update(loaded)
-    except Exception:
-        pass
-
-    state.setdefault("pair_alerts", {})
-    state.setdefault("ticker_alerts", {})
-    state.setdefault("ticker_cooldowns", {})
-    state.setdefault("bypasses", {})
-    state.setdefault("watchlist", [])
-    state.setdefault("stats", {})
-
-    for key in [
-        "tiktok_found",
-        "watch_hits",
-        "pair_suppressed",
-        "ticker_suppressed",
-        "bypassed",
-        "forcechecks",
-        "fetch_errors",
-        "fetch_429s",
-    ]:
-        state["stats"].setdefault(key, 0)
-
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        print("save state error", e, flush=True)
-
+def on_open(ws):
+    global connected
+    connected=True
+    ws.send(json.dumps({'method':'subscribeNewToken'}))
+    LOG.info('WebSocket connected and subscribed')
+def on_close(ws,*args):
+    global connected
+    connected=False
+    LOG.warning('WebSocket closed %s',args)
+def on_error(ws,error): LOG.warning('WebSocket error %s',error)
+def on_message(ws,message):
+    global last_event,last_coin
+    try: ev=json.loads(message)
+    except ValueError: return
+    if not isinstance(ev,dict): return
+    mint=ev.get('mint') or ev.get('mintAddress') or ev.get('ca')
+    if not mint: return
+    uri=ev.get('uri') or ev.get('metadataUri') or ev.get('metadata_uri')
+    with lock:
+        if mint in state['mints']: return
+        last_event=time.time(); last_coin=mint
+        state['mints'][mint]={'seen_at':last_event,'name':ev.get('name',''),
+                              'symbol':ev.get('symbol',''),'uri':str(uri or '')[:500],
+                              'attempts':0,'last_result':'queued' if uri else 'missing_uri'}
+        inc('tokens_seen')
+    if not uri:
+        inc('metadata_missing_uri')
+        return
+    enqueue(mint,uri,{'name':ev.get('name',''),'symbol':ev.get('symbol',''),
+                      'marketCapSol':ev.get('marketCapSol')})
 
 def load_offset():
     try:
-        with open(OFFSET_FILE, "r") as f:
-            return int(json.load(f).get("offset", 0))
-    except Exception:
-        return 0
-
-
-def save_offset(offset):
-    try:
-        with open(OFFSET_FILE, "w") as f:
-            json.dump({"offset": offset}, f)
-    except Exception:
-        pass
-
-
-def drain_updates():
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{BOT}/getUpdates",
-            params={"timeout": 0},
-            timeout=10,
-        )
-        updates = r.json().get("result", [])
-        if updates:
-            newest = updates[-1]["update_id"] + 1
-            save_offset(newest)
-            return newest
-    except Exception:
-        pass
-
-    return load_offset()
-
-
-load_state()
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"running")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-
-threading.Thread(
-    target=lambda: HTTPServer(("0.0.0.0", 3003), HealthHandler).serve_forever(),
-    daemon=True,
-).start()
-
-
-def tg(text):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT}/sendMessage",
-            json={
-                "chat_id": CHAT,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print("telegram msg error", e, flush=True)
-
-
-def tg_photo(img, caption):
-    global alerts_sent
-
-    try:
-        if img:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT}/sendPhoto",
-                json={
-                    "chat_id": CHAT,
-                    "photo": img,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                },
-                timeout=10,
-            )
-        else:
-            tg(caption)
-
-        alerts_sent += 1
-    except Exception as e:
-        print("telegram photo error", e, flush=True)
-
-
-def fetch_coin(mint, ignore_rate_limit=False):
-    global rate_limited_until
-
-    if not ignore_rate_limit and time.time() < rate_limited_until:
-        return None
-
-    try:
-        url = f"https://frontend-api-v3.pump.fun/coins/{mint}?sync=true"
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-
-        if r.status_code == 429:
-            stat_inc("fetch_429s")
-            rate_limited_until = time.time() + 60
-            print("429 from pump.fun, backing off 60s", flush=True)
-            save_state()
-            return None
-
-        if r.status_code != 200:
-            stat_inc("fetch_errors")
-            print("fetch status", r.status_code, mint, flush=True)
-            save_state()
-            return None
-
-        text = r.text.strip()
-        if not text:
-            stat_inc("fetch_errors")
-            save_state()
-            return None
-
-        data = r.json()
-        return data.get("data", data)
-
-    except Exception as e:
-        stat_inc("fetch_errors")
-        print("fetch error", e, flush=True)
-        save_state()
-        return None
-
-
-def find_tiktok(text):
-    text = str(text or "")
-    text = text.replace("\\", " ").replace('"', " ").replace("'", " ")
-    text = text.replace("<", " ").replace(">", " ")
-
-    for part in text.split():
-        lower = part.lower()
-        if "tiktok.com" in lower or "vm.tiktok.com" in lower or "vt.tiktok.com" in lower:
-            if part.startswith("http"):
-                return part.strip(",)]}")
-
-    return None
-
-
-def clean_old_state():
-    now = time.time()
-
-    state["pair_alerts"] = {
-        k: v for k, v in state.get("pair_alerts", {}).items()
-        if now - float(v) < PAIR_COOLDOWN_SECONDS
-    }
-
-    state["ticker_cooldowns"] = {
-        k: v for k, v in state.get("ticker_cooldowns", {}).items()
-        if now < float(v)
-    }
-
-    state["ticker_alerts"] = {
-        k: v for k, v in state.get("ticker_alerts", {}).items()
-        if now - float(v.get("first_seen", now)) < TICKER_COOLDOWN_SECONDS
-    }
-
-    save_state()
-
-
-def is_bypassed(name, symbol):
-    pkey = pair_key(name, symbol)
-    skey = ticker_key(symbol)
-
-    bypasses = state.get("bypasses", {})
-
-    if pkey in bypasses:
-        return True, "name+ticker bypass"
-
-    if skey in bypasses:
-        return True, "ticker bypass"
-
-    return False, ""
-
-
-def should_alert(name, symbol):
-    clean_old_state()
-
-    pkey = pair_key(name, symbol)
-    skey = ticker_key(symbol)
-    now = time.time()
-
-    watch_phrase = matched_watch_phrase(name, symbol)
-    if watch_phrase:
-        stat_inc("watch_hits")
-        return True, "watchlist: " + watch_phrase
-
-    bypassed, reason = is_bypassed(name, symbol)
-    if bypassed:
-        stat_inc("bypassed")
-        return True, reason
-
-    if pkey in state["pair_alerts"]:
-        if now - float(state["pair_alerts"][pkey]) < PAIR_COOLDOWN_SECONDS:
-            stat_inc("pair_suppressed")
-            save_state()
-            return False, "same name+ticker suppressed"
-
-    if skey in state["ticker_cooldowns"] and now < float(state["ticker_cooldowns"][skey]):
-        stat_inc("ticker_suppressed")
-        save_state()
-        return False, "ticker cooldown active"
-
-    ticker_data = state["ticker_alerts"].get(skey, {
-        "count": 0,
-        "first_seen": now,
-    })
-
-    if int(ticker_data.get("count", 0)) >= TICKER_LIMIT:
-        state["ticker_cooldowns"][skey] = now + TICKER_COOLDOWN_SECONDS
-        state["ticker_alerts"].pop(skey, None)
-        stat_inc("ticker_suppressed")
-        save_state()
-        return False, "ticker limit hit, cooldown started"
-
-    return True, "allowed"
-
-
-def record_alert(name, symbol):
-    pkey = pair_key(name, symbol)
-    skey = ticker_key(symbol)
-    now = time.time()
-
-    state["pair_alerts"][pkey] = now
-
-    ticker_data = state["ticker_alerts"].get(skey, {
-        "count": 0,
-        "first_seen": now,
-    })
-
-    ticker_data["count"] = int(ticker_data.get("count", 0)) + 1
-    ticker_data["last_seen"] = now
-    state["ticker_alerts"][skey] = ticker_data
-
-    if ticker_data["count"] >= TICKER_LIMIT:
-        state["ticker_cooldowns"][skey] = now + TICKER_COOLDOWN_SECONDS
-        state["ticker_alerts"].pop(skey, None)
-
-    save_state()
-
-
-def send_tiktok_alert(coin, mint, tiktok, allow_reason):
-    global last_alert
-
-    name = coin.get("name", "Unknown")
-    symbol = coin.get("symbol", "Unknown")
-    image = coin.get("image_uri") or coin.get("image") or ""
-    pump = f"https://pump.fun/coin/{mint}"
-
-    caption = (
-        "🚨 <b>New Pump.fun TikTok Coin</b>" + n() + n()
-        + "🪙 <b>Name:</b> " + esc(name) + n()
-        + "🏷 <b>Ticker:</b> " + esc(symbol) + n()
-        + "💰 <b>Market Cap:</b> " + money(coin.get("usd_market_cap")) + n() + n()
-        + "🎵 <b>TikTok:</b>" + n() + esc(tiktok) + n() + n()
-        + "🚀 <b>Pump.fun:</b>" + n() + pump + n() + n()
-        + "🧬 <b>CA:</b>" + n() + "<code>" + esc(mint) + "</code>"
-    )
-
-    if allow_reason.startswith("watchlist:"):
-        caption += n() + n() + "👁 <b>Watchlist:</b> " + esc(allow_reason.replace("watchlist:", "").strip())
-
-    if "bypass" in allow_reason:
-        caption += n() + n() + "🟢 <b>Bypass:</b> " + esc(allow_reason)
-
-    if "forcecheck" in allow_reason:
-        caption += n() + n() + "🧪 <b>Manual forcecheck</b>"
-
-    tg_photo(image, caption)
-    last_alert = f"{name} / {symbol}"
-
-
-def check_coin(mint, delay):
-    time.sleep(delay)
-
-    coin = fetch_coin(mint)
-    if not coin:
-        return
-
-    tiktok = find_tiktok(json.dumps(coin))
-
-    if not tiktok:
-        return
-
-    stat_inc("tiktok_found")
-
-    name = coin.get("name", "Unknown")
-    symbol = coin.get("symbol", "Unknown")
-
-    allowed, reason = should_alert(name, symbol)
-
-    if not allowed:
-        print("suppressed", reason, name, symbol, flush=True)
-        return
-
-    record_alert(name, symbol)
-    send_tiktok_alert(coin, mint, tiktok, reason)
-
-
-def schedule_checks(mint):
-    for delay in [10, 45, 180, 600, 1800]:
-        threading.Thread(target=check_coin, args=(mint, delay), daemon=True).start()
-
-
-def on_open(ws):
-    global ws_connected
-
-    ws_connected = True
-    print("websocket connected", flush=True)
-    ws.send(json.dumps({"method": "subscribeNewToken"}))
-
-
-def on_close(ws, *args):
-    global ws_connected
-
-    ws_connected = False
-    print("websocket closed", flush=True)
-
-
-def on_message(ws, message):
-    global tokens_seen, last_coin
-
-    try:
-        event = json.loads(message)
-        mint = event.get("mint") or event.get("mintAddress") or event.get("ca")
-
-        if not mint or mint in seen_mints:
-            return
-
-        seen_mints.add(mint)
-        tokens_seen += 1
-        last_coin = mint
-
-        schedule_checks(mint)
-
-    except Exception as e:
-        print("message error", e, flush=True)
-
-
-def status_text():
-    stats = state.get("stats", {})
-    return (
-        "✅ <b>TikTok Agent Status</b>" + n() + n()
-        + "🔌 <b>Websocket:</b> " + ("connected" if ws_connected else "disconnected") + n()
-        + "⏱ <b>Uptime:</b> " + uptime() + n()
-        + "👀 <b>Tokens seen:</b> " + str(tokens_seen) + n()
-        + "🎵 <b>TikTok found:</b> " + str(stats.get("tiktok_found", 0)) + n()
-        + "🚨 <b>Alerts sent:</b> " + str(alerts_sent) + n()
-        + "👁 <b>Watchlist hits:</b> " + str(stats.get("watch_hits", 0)) + n()
-        + "🔁 <b>Pair suppressed:</b> " + str(stats.get("pair_suppressed", 0)) + n()
-        + "🏷 <b>Ticker suppressed:</b> " + str(stats.get("ticker_suppressed", 0)) + n()
-        + "🟢 <b>Bypassed:</b> " + str(stats.get("bypassed", 0)) + n()
-        + "🧪 <b>Forcechecks:</b> " + str(stats.get("forcechecks", 0)) + n()
-        + "🚧 <b>429s:</b> " + str(stats.get("fetch_429s", 0)) + n()
-        + "⚠️ <b>Fetch errors:</b> " + str(stats.get("fetch_errors", 0)) + n() + n()
-        + "🪙 <b>Last coin:</b>" + n() + "<code>" + esc(last_coin) + "</code>" + n()
-        + "📣 <b>Last alert:</b> " + esc(last_alert) + n()
-        + "🕒 <b>Checked:</b> " + now_utc()
-    )
-
-
-def watchlist_text():
-    watchlist = state.get("watchlist", [])
-
-    if not watchlist:
-        return "👁 Watchlist is empty."
-
-    lines = ["👁 <b>Watchlist</b>", ""]
-
-    for phrase in sorted(watchlist):
-        lines.append("• <code>" + esc(phrase) + "</code>")
-
-    return n().join(lines)
-
-
-def bypasses_text():
-    bypasses = state.get("bypasses", {})
-
-    if not bypasses:
-        return "🟢 No active bypasses."
-
-    lines = ["🟢 <b>Active Bypasses</b>", ""]
-
-    for key, value in sorted(bypasses.items()):
-        lines.append("• <code>" + esc(key) + "</code> — " + esc(value))
-
-    return n().join(lines)
-
-
-def cooldowns_text():
-    clean_old_state()
-    now = time.time()
-
-    lines = ["🧊 <b>Cooldowns</b>", ""]
-
-    if state.get("ticker_cooldowns"):
-        lines.append("<b>Ticker cooldowns:</b>")
-        for ticker, until in sorted(state["ticker_cooldowns"].items()):
-            mins = max(0, int((float(until) - now) // 60))
-            lines.append("• <code>" + esc(ticker) + "</code> — " + str(mins) + " min left")
-    else:
-        lines.append("No active ticker cooldowns.")
-
-    return n().join(lines)
-
+        with open(OFFSET_PATH) as f: return int(json.load(f).get('offset',0))
+    except (OSError,ValueError): return 0
+def save_offset(n):
+    tmp=OFFSET_PATH+'.tmp'
+    with open(tmp,'w') as f: json.dump({'offset':n},f)
+    os.replace(tmp,OFFSET_PATH)
+
+def diagnostics():
+    with lock:
+        now=time.time(); samples=[result for ts,result in recent if now-ts<3600]
+        counts={k:samples.count(k) for k in set(samples)}
+        s=state['stats']; q=len(pending); f=len(inflight)
+        return (f'🔬 <b>Detection diagnostics</b>\n'
+                f'WebSocket: {"connected" if connected else "disconnected"}\n'
+                f'Last launch: {int(now-last_event)}s ago\n' if last_event else '🔬 <b>Detection diagnostics</b>\nNo launches received this uptime\n') + (
+                f'Last metadata success: {int(now-last_success)}s ago\n' if last_success else 'No successful metadata fetch this uptime\n') + (
+                f'Pending: {q} | Active: {f}\n'
+                f'Last hour: {len(samples)} checks; {counts.get("tiktok_found",0)} TikTok links; '
+                f'{counts.get("no_tiktok",0)} no TikTok; {counts.get("fetch_error",0)} fetch failures\n'
+                f'Cumulative: {s["tokens_seen"]} launches; {s["metadata_ok"]} metadata successes; '
+                f'{s["metadata_404"]} 404s; {s["metadata_429"]} 429s; '
+                f'{s["metadata_403"]} 401/403s; {s["metadata_missing_uri"]} missing URIs; '
+                f'{s["alerts_sent"]} alerts; {s["queue_dropped"]} queue drops\n'
+                f'Checked: {utc()}')
+
+def status():
+    with lock:
+        s=state['stats']
+        return (f'✅ <b>TikTok Agent Status</b>\n\n'
+                f'🔌 WebSocket: {"connected" if connected else "disconnected"}\n'
+                f'⏱ Uptime: {int((time.time()-start)//3600)}h {int((time.time()-start)%3600//60)}m\n'
+                f'👀 Tokens seen: {s["tokens_seen"]}\n'
+                f'🎵 TikTok found: {s["tiktok_found"]}\n'
+                f'🚨 Alerts sent: {s["alerts_sent"]}\n'
+                f'🔁 Pair suppressed: {s["pair_suppressed"]}\n'
+                f'🏷 Ticker suppressed: {s["ticker_suppressed"]}\n'
+                f'🚧 Metadata 404s: {s["metadata_404"]}\n'
+                f'⚠️ Metadata errors: {s["metadata_fail"]}\n'
+                f'🪙 Last coin: <code>{esc(last_coin)}</code>\n'
+                f'📣 Last alert: {esc(last_alert or "None this uptime")}\n'
+                f'🕒 Checked: {utc()}')
+
+def debug(mint):
+    with lock: record=state['mints'].get(mint)
+    if not record: return ('🧪 No recorded history for this mint. It may predate the update, '
+                           'have been missed by the WebSocket, or be outside the 72h retention period.\n'
+                           f'<code>{esc(mint)}</code>')
+    return (f'🧪 <b>Mint history</b>\nName: {esc(record.get("name"))}\n'
+            f'Ticker: {esc(record.get("symbol"))}\n'
+            f'Seen: {utc(record.get("seen_at"))}\n'
+            f'Metadata URI: {"present" if record.get("uri") else "missing"}\n'
+            f'Attempts: {record.get("attempts",0)}\n'
+            f'Last result: {esc(record.get("last_result"))}\n'
+            f'Detail: {esc(record.get("detail"))}\n'
+            f'Alerted: {utc(record["alerted_at"]) if record.get("alerted_at") else "No"}\n'
+            f'CA: <code>{esc(mint)}</code>')
 
 def command_loop():
-    offset = drain_updates()
-
+    offset=load_offset()
     while True:
         try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{BOT}/getUpdates",
-                params={"timeout": 25, "offset": offset},
-                timeout=30,
-            )
-
-            for update in r.json().get("result", []):
-                offset = update["update_id"] + 1
-                save_offset(offset)
-
-                msg = update.get("message", {})
-                chat = str(msg.get("chat", {}).get("id", ""))
-                text = (msg.get("text") or "").strip()
-
-                if chat != CHAT:
-                    continue
-
-                lower = text.lower()
-
-                if lower in ["/status", "status", "/ping", "ping"]:
-                    tg(status_text())
-
-                elif lower in ["/cooldowns", "cooldowns"]:
-                    tg(cooldowns_text())
-
-                elif lower in ["/bypasses", "bypasses"]:
-                    tg(bypasses_text())
-
-                elif lower in ["/watchlist", "watchlist"]:
-                    tg(watchlist_text())
-
-                elif lower.startswith("/watch "):
-                    phrase = text.split(" ", 1)[1].strip().lower()
-
-                    if not phrase:
-                        tg("Use it like:" + n() + "<code>/watch bro</code>")
-                        continue
-
-                    if phrase not in state["watchlist"]:
-                        state["watchlist"].append(phrase)
-                        state["watchlist"] = sorted(list(set(state["watchlist"])))
-                        save_state()
-
-                    tg(
-                        "👁 Watching name/ticker phrase:" + n()
-                        + "<code>" + esc(phrase) + "</code>" + n() + n()
-                        + "Whole-word matching is ON."
-                    )
-
-                elif lower.startswith("/unwatch "):
-                    phrase = text.split(" ", 1)[1].strip().lower()
-
-                    if phrase in state["watchlist"]:
-                        state["watchlist"].remove(phrase)
-                        save_state()
-                        tg("🗑 Removed watch phrase:" + n() + "<code>" + esc(phrase) + "</code>")
-                    else:
-                        tg("That phrase is not in the watchlist.")
-
-                elif lower.startswith("/bypass "):
-                    raw = text.split(" ", 1)[1].strip()
-                    parts = raw.split("|")
-
-                    if len(parts) == 2:
-                        name = parts[0].strip()
-                        symbol = parts[1].strip()
-                        key = pair_key(name, symbol)
-                        state["bypasses"][key] = "name+ticker"
-                        save_state()
-                        tg("🟢 Bypassing exact name+ticker:" + n() + "<code>" + esc(key) + "</code>")
-                    else:
-                        symbol = raw.strip()
-                        key = ticker_key(symbol)
-                        state["bypasses"][key] = "ticker"
-                        save_state()
-                        tg("🟢 Bypassing ticker:" + n() + "<code>" + esc(key) + "</code>")
-
-                elif lower.startswith("/unbypass "):
-                    raw = text.split(" ", 1)[1].strip()
-                    parts = raw.split("|")
-
-                    if len(parts) == 2:
-                        key = pair_key(parts[0].strip(), parts[1].strip())
-                    else:
-                        key = ticker_key(raw)
-
-                    if key in state["bypasses"]:
-                        del state["bypasses"][key]
-                        save_state()
-                        tg("🗑 Removed bypass:" + n() + "<code>" + esc(key) + "</code>")
-                    else:
-                        tg("Could not find that bypass.")
-
-                elif lower.startswith("/debug "):
-                    mint = text.split(" ", 1)[1].strip()
-                    coin = fetch_coin(mint, ignore_rate_limit=True)
-
-                    if not coin:
-                        tg("Could not fetch that coin.")
-                        continue
-
-                    name = coin.get("name", "Unknown")
-                    symbol = coin.get("symbol", "Unknown")
-                    tiktok = find_tiktok(json.dumps(coin))
-                    allowed, reason = should_alert(name, symbol)
-
-                    tg(
-                        "🧪 <b>Debug Result</b>" + n() + n()
-                        + "🪙 <b>Name:</b> " + esc(name) + n()
-                        + "🏷 <b>Ticker:</b> " + esc(symbol) + n()
-                        + "🎵 <b>TikTok found:</b> " + ("YES" if tiktok else "NO") + n()
-                        + "🔗 <b>TikTok:</b> " + esc(tiktok or "None") + n()
-                        + "🚦 <b>Would alert:</b> " + ("YES" if allowed else "NO") + n()
-                        + "🧠 <b>Reason:</b> " + esc(reason) + n()
-                        + "🧬 <b>CA:</b>" + n()
-                        + "<code>" + esc(mint) + "</code>"
-                    )
-
-                elif lower.startswith("/forcecheck "):
-                    mint = text.split(" ", 1)[1].strip()
-                    coin = fetch_coin(mint, ignore_rate_limit=True)
-
-                    if not coin:
-                        tg("Could not fetch that coin.")
-                        continue
-
-                    tiktok = find_tiktok(json.dumps(coin))
-
-                    if not tiktok:
-                        tg("No TikTok found in metadata for:" + n() + "<code>" + esc(mint) + "</code>")
-                        continue
-
-                    stat_inc("forcechecks")
-                    send_tiktok_alert(coin, mint, tiktok, "manual forcecheck")
-                    tg("✅ Forcecheck completed.")
-
-                elif lower in ["/restart", "restart"]:
-                    tg("♻️ Restarting TikTok agent...")
-                    time.sleep(1)
-                    os._exit(0)
-
-                elif lower in ["/help", "help"]:
-                    tg(
-                        "🤖 <b>Commands</b>" + n() + n()
-                        + "/status - health check" + n()
-                        + "/watch phrase - alert matching TikTok launches" + n()
-                        + "/unwatch phrase - remove watch phrase" + n()
-                        + "/watchlist - show watched phrases" + n()
-                        + "/cooldowns - show active ticker cooldowns" + n()
-                        + "/bypasses - show active bypasses" + n()
-                        + "/bypass TICKER - bypass ticker cooldowns" + n()
-                        + "/bypass NAME | TICKER - bypass exact name+ticker cooldowns" + n()
-                        + "/unbypass TICKER - remove ticker bypass" + n()
-                        + "/unbypass NAME | TICKER - remove exact bypass" + n()
-                        + "/debug CA - diagnose missed coin" + n()
-                        + "/forcecheck CA - manually check and alert if TikTok exists" + n()
-                        + "/restart - restart bot"
-                    )
-
-        except Exception as e:
-            print("command error", e, flush=True)
-            time.sleep(5)
-
-
-def heartbeat_loop():
-    while True:
-        time.sleep(HEARTBEAT_MINUTES * 60)
-        tg("🟢 <b>Scheduled TikTok Agent Checkup</b>" + n() + n() + status_text())
-
-
-threading.Thread(target=command_loop, daemon=True).start()
-threading.Thread(target=heartbeat_loop, daemon=True).start()
-
-while True:
-    try:
-        websocket.WebSocketApp(
-            "wss://pumpportal.fun/api/data",
-            on_open=on_open,
-            on_message=on_message,
-            on_close=on_close,
-        ).run_forever()
-
-    except Exception as e:
-        print("websocket crash", e, flush=True)
-
-    print("reconnecting websocket in 5s", flush=True)
-    time.sleep(5)
+            r=requests.get(f'https://api.telegram.org/bot{BOT}/getUpdates',
+                           params={'offset':offset,'timeout':25},timeout=32)
+            if not r.ok:
+                LOG.warning('getUpdates HTTP %s %s',r.status_code,r.text[:150]); time.sleep(5); continue
+            for update in r.json().get('result',[]):
+                offset=update['update_id']+1; save_offset(offset)
+                msg=update.get('message') or {}
+                if str((msg.get('chat') or {}).get('id',''))!=CHAT: continue
+                command=(msg.get('text') or '').strip()
+                if not command: continue
+                first,_,arg=command.partition(' ')
+                cmd=first.split('@')[0].lower().lstrip('/')
+                arg=arg.strip()
+                if cmd in ('status','ping'): telegram(status())
+                elif cmd=='diagnostics': telegram(diagnostics())
+                elif cmd=='watchlist': telegram('👀 Watches:\n'+('\n'.join('• '+esc(w) for w in state['watchlist']) or 'None'))
+                elif cmd=='watch' and arg:
+                    with lock:
+                        if norm(arg) not in state['watchlist']: state['watchlist'].append(norm(arg))
+                    save(); telegram('👀 Watching <code>'+esc(norm(arg))+'</code>')
+                elif cmd=='unwatch' and arg:
+                    with lock: state['watchlist']=[x for x in state['watchlist'] if x!=norm(arg)]
+                    save(); telegram('Removed <code>'+esc(norm(arg))+'</code>')
+                elif cmd=='bypass' and arg:
+                    # Accept ticker or "name | ticker".
+                    key=pair(*[x.strip() for x in arg.split('|',1)]) if '|' in arg else norm(arg)
+                    with lock: state['bypasses'][key]=time.time()
+                    save(); telegram('🟢 Bypass added: <code>'+esc(arg)+'</code>')
+                elif cmd=='unbypass' and arg:
+                    key=pair(*[x.strip() for x in arg.split('|',1)]) if '|' in arg else norm(arg)
+                    with lock: state['bypasses'].pop(key,None)
+                    save(); telegram('Bypass removed: <code>'+esc(arg)+'</code>')
+                elif cmd=='bypasses': telegram('🟢 Bypasses:\n'+('\n'.join(esc(k) for k in state['bypasses']) or 'None'))
+                elif cmd=='cooldowns':
+                    with lock:
+                        lines=[f'{esc(k)} — {int((float(v)-time.time())/60)}m' for k,v in state['ticker_cooldowns'].items() if float(v)>time.time()]
+                    telegram('🔇 Ticker cooldowns:\n'+('\n'.join(lines[:50]) or 'None'))
+                elif cmd=='debug' and arg: telegram(debug(arg))
+                elif cmd in ('recheck','forcecheck') and arg:
+                    with lock: record=state['mints'].get(arg)
+                    if not record or not record.get('uri'): telegram('No stored metadata URI for this mint.'); continue
+                    with lock: state['alerted_mints'].pop(arg,None)
+                    if enqueue(arg,record['uri'],{'name':record.get('name'),'symbol':record.get('symbol')},attempt=1):
+                        telegram('Queued metadata recheck. Normal cooldown rules still apply.')
+                    else: telegram('Mint already queued or queue full.')
+                elif cmd=='restart':
+                    telegram('♻️ Restarting agent'); save(); os._exit(1)
+                elif cmd=='help':
+                    telegram('Commands: /status /diagnostics /watch phrase /unwatch phrase /watchlist '
+                             '/bypass TICKER /bypass NAME | TICKER /unbypass TICKER '
+                             '/bypasses /cooldowns /debug CA /recheck CA /restart')
+        except Exception: LOG.exception('Telegram command loop error'); time.sleep(5)
