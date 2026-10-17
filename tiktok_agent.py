@@ -164,17 +164,17 @@ def metadata_host(uri):
     normalized = normalize_uri(uri)
     return (urlparse(normalized).hostname or '').lower() if normalized else ''
 
-def wait_for_slot(host):
-    """Reserve a per-host AND global request slot without holding a lock while waiting."""
+def reserve_slot(host):
+    """Nonblocking reservation: returns seconds until eligible, or zero if reserved."""
     global global_next
     with lock:
         now = time.time()
-        when = max(now, host_next.get(host, 0), global_next)
-        host_next[host] = when + HOST_INTERVAL
-        global_next = when + GLOBAL_INTERVAL
-    delay = when - time.time()
-    if delay > 0:
-        time.sleep(delay)
+        ready = max(host_next.get(host, 0), global_next)
+        if ready > now:
+            return ready - now
+        host_next[host] = now + HOST_INTERVAL
+        global_next = now + GLOBAL_INTERVAL
+        return 0.0
 
 def throttle_host(host, retry_after=None):
     """Honor Retry-After, or apply capped exponential backoff with jitter."""
@@ -182,7 +182,7 @@ def throttle_host(host, retry_after=None):
     with lock:
         strikes = min(8, host_strikes.get(host, 0) + 1)
         host_strikes[host] = strikes
-        backoff = min(300, 10 * 2 ** (strikes - 1)) + random.uniform(0, 3)
+        backoff = min(900, 60 * 2 ** (strikes - 1)) + random.uniform(0, 5)
         if retry_after is not None:
             try:
                 backoff = max(backoff, min(900, float(retry_after)))
@@ -207,7 +207,9 @@ def fetch_metadata(uri):
         host = metadata_host(target)
         if not host:
             return None, 'invalid_uri'
-        wait_for_slot(host)
+        delay = reserve_slot(host)
+        if delay > 0:
+            return None, 'deferred:' + str(round(delay + 0.05, 2))
         try:
             r = requests.get(target, headers={'Accept':'application/json',
                              'User-Agent':'TikTokLaunchRadar/3.0'},
@@ -338,6 +340,15 @@ def check(mint,uri,event,attempt):
     global last_success
     meta,result=fetch_metadata(uri)
     if meta is None:
+        if result.startswith('deferred:'):
+            with lock:
+                inflight.discard(mint)
+            try:
+                delay = max(0.2, float(result.split(':', 1)[1]))
+            except ValueError:
+                delay = 2.0
+            enqueue(mint, uri, event, attempt, delay)
+            return
         inc('metadata_fail')
         if result=='404': inc('metadata_404')
         elif result=='429': inc('metadata_429')
@@ -367,21 +378,41 @@ def check(mint,uri,event,attempt):
 def scheduler():
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         while True:
-            item=None
+            item = None
             with lock:
-                if pending and pending[0][0]<=time.time() and len(inflight)<WORKERS:
-                    item=heapq.heappop(pending)
-                    mint=item[2]
+                now = time.time()
+                # Reposition blocked work without consuming a worker.
+                # Check at most 100 due items each pass, allowing other hosts through.
+                inspected = 0
+                while (pending and pending[0][0] <= now
+                       and len(inflight) < WORKERS and inspected < 100):
+                    candidate = heapq.heappop(pending)
+                    due, seq, mint, uri, event, attempt = candidate
+                    host = metadata_host(uri)
+                    if host:
+                        next_ready = max(host_next.get(host, 0), global_next)
+                    else:
+                        next_ready = now
+                    if next_ready > now:
+                        heapq.heappush(pending, (next_ready + 0.05, seq, mint, uri, event, attempt))
+                        inspected += 1
+                        continue
                     pending_ids.discard(mint)
                     inflight.add(mint)
+                    item = candidate
+                    break
             if not item:
-                time.sleep(.15); continue
-            _,_,mint,uri,event,attempt=item
-            def task(m=mint,u=uri,e=event,a=attempt):
-                try: check(m,u,e,a)
-                except Exception: LOG.exception('check failed for %s',m)
+                time.sleep(0.15)
+                continue
+            _, _, mint, uri, event, attempt = item
+            def task(m=mint, u=uri, e=event, a=attempt):
+                try:
+                    check(m, u, e, a)
+                except Exception:
+                    LOG.exception('check failed for %s', m)
                 finally:
-                    with lock: inflight.discard(m)
+                    with lock:
+                        inflight.discard(m)
             pool.submit(task)
 
 def on_open(ws):
@@ -435,6 +466,7 @@ def diagnostics():
                 f'Last metadata success: {int(now-last_success)}s ago\n' if last_success else 'No successful metadata fetch this uptime\n') + (
                 f'Pending: {q} | Active: {f}\n'
                 f'Rate limiter: {len(host_next)} hosts; {host_throttled} throttles; {cache_hits} cache hits\n'
+                f'Longest host wait: {max(0, int(max(host_next.values(), default=now)-now))}s\n'
                 f'Last hour: {len(samples)} checks; {counts.get("tiktok_found",0)} TikTok links; '
                 f'{counts.get("no_tiktok",0)} no TikTok; {counts.get("fetch_error",0)} fetch failures\n'
                 f'Cumulative (includes previous deployments): {s["tokens_seen"]} launches; {s["metadata_ok"]} metadata successes; '
