@@ -16,6 +16,8 @@ HOST_INTERVAL = max(0.2, float(os.getenv('HOST_REQUEST_INTERVAL', '2.0')))
 GLOBAL_INTERVAL = max(0.1, float(os.getenv('GLOBAL_REQUEST_INTERVAL', '0.6')))
 MAX_ATTEMPTS = max(3, int(os.getenv('MAX_METADATA_ATTEMPTS', '8')))
 MAX_PENDING = max(1000, int(os.getenv('MAX_PENDING', '12000')))
+MAX_QUEUE_AGE = max(60, int(os.getenv('MAX_QUEUE_AGE_SECONDS', '900')))
+FRESH_BURST = max(1, int(os.getenv('FRESH_BURST', '5')))
 PUMPPORTAL_API_KEY = os.getenv('PUMPPORTAL_API_KEY', '').strip()
 DATA = os.getenv('DATA_DIR', '/data')
 os.makedirs(DATA, exist_ok=True)
@@ -34,7 +36,8 @@ last_success = 0.0
 last_alert = ''
 last_coin = ''
 last_problem_notice = 0.0
-pending = []
+pending = []  # retry queue
+fresh_pending = []  # first checks have priority
 pending_ids = set()
 inflight = set()
 sequence = 0
@@ -45,7 +48,7 @@ state = {
 DEFAULT_STATS = ('tokens_seen','metadata_ok','metadata_fail','metadata_404','metadata_429','metadata_403',
                  'metadata_other_http','metadata_missing_uri','tiktok_found','alerts_sent','alert_errors',
                  'pair_suppressed','ticker_suppressed','watch_hits','retries','queue_dropped','non_tiktok',
-                 'websocket_reconnects','checks_completed')
+                 'websocket_reconnects','checks_completed','expired_checks')
 recent = deque(maxlen=10000)
 # These limits are intentionally shared across workers, including metadata retries.
 host_next = {}
@@ -264,15 +267,52 @@ def record_check(mint, outcome, attempt, detail=''):
         recent.append((time.time(),outcome))
         inc('checks_completed')
 
+def queue_size():
+    return len(fresh_pending) + len(pending)
+
+def mint_expired(mint, now=None):
+    now = now if now is not None else time.time()
+    record = state['mints'].get(mint, {})
+    return now - float(record.get('seen_at', now)) >= MAX_QUEUE_AGE
+
+def mark_expired(mint):
+    record = state['mints'].get(mint)
+    if record and record.get('last_result') != 'expired':
+        record['last_result'] = 'expired'
+        record['detail'] = 'Exceeded metadata freshness window'
+        inc('expired_checks')
+
+def expire_queued():
+    """Sweep stale work, including future-due retries, without network calls."""
+    with lock:
+        now = time.time()
+        for heap in (fresh_pending, pending):
+            kept = []
+            for item in heap:
+                mint = item[2]
+                if mint_expired(mint, now):
+                    pending_ids.discard(mint)
+                    mark_expired(mint)
+                else:
+                    kept.append(item)
+            if len(kept) != len(heap):
+                heap[:] = kept
+                heapq.heapify(heap)
+
 def enqueue(mint, uri, event, attempt=1, delay=0):
     global sequence
     with lock:
-        if mint in state['alerted_mints'] or mint in pending_ids or mint in inflight: return False
-        if len(pending)>=MAX_PENDING:
+        if mint in state['alerted_mints'] or mint in pending_ids or mint in inflight:
+            return False
+        if mint_expired(mint):
+            mark_expired(mint)
+            return False
+        if queue_size() >= MAX_PENDING:
             inc('queue_dropped')
             return False
-        sequence+=1
-        heapq.heappush(pending,(time.time()+delay,sequence,mint,uri,event,attempt))
+        sequence += 1
+        item = (time.time() + delay, sequence, mint, uri, event, attempt)
+        heapq.heappush(fresh_pending if attempt == 1 else pending, item)
         pending_ids.add(mint)
         return True
 
@@ -338,6 +378,10 @@ def alert(mint, event, meta, tiktok):
 
 def check(mint,uri,event,attempt):
     global last_success
+    with lock:
+        if mint_expired(mint):
+            mark_expired(mint)
+            return
     meta,result=fetch_metadata(uri)
     if meta is None:
         if result.startswith('deferred:'):
@@ -376,31 +420,44 @@ def check(mint,uri,event,attempt):
         record_check(mint,'no_tiktok',attempt)
 
 def scheduler():
+    """Prioritize new launches; give retries periodic turns to avoid starvation."""
+    fresh_count = 0
+    last_sweep = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         while True:
             item = None
+            now = time.time()
+            if now - last_sweep >= 10:
+                expire_queued()
+                last_sweep = now
             with lock:
-                now = time.time()
-                # Reposition blocked work without consuming a worker.
-                # Check at most 100 due items each pass, allowing other hosts through.
-                inspected = 0
-                while (pending and pending[0][0] <= now
-                       and len(inflight) < WORKERS and inspected < 100):
-                    candidate = heapq.heappop(pending)
-                    due, seq, mint, uri, event, attempt = candidate
-                    host = metadata_host(uri)
-                    if host:
-                        next_ready = max(host_next.get(host, 0), global_next)
-                    else:
-                        next_ready = now
-                    if next_ready > now:
-                        heapq.heappush(pending, (next_ready + 0.05, seq, mint, uri, event, attempt))
-                        inspected += 1
-                        continue
-                    pending_ids.discard(mint)
-                    inflight.add(mint)
-                    item = candidate
-                    break
+                if len(inflight) < WORKERS:
+                    prefer_retry = fresh_count >= FRESH_BURST
+                    heaps = ((pending, fresh_pending) if prefer_retry
+                             else (fresh_pending, pending))
+                    for heap in heaps:
+                        inspected = 0
+                        while heap and heap[0][0] <= now and inspected < 100:
+                            candidate = heapq.heappop(heap)
+                            due, seq, mint, uri, event, attempt = candidate
+                            pending_ids.discard(mint)
+                            if mint_expired(mint, now):
+                                mark_expired(mint)
+                                inspected += 1
+                                continue
+                            host = metadata_host(uri)
+                            ready = max(host_next.get(host, 0), global_next) if host else now
+                            if ready > now:
+                                heapq.heappush(heap, (ready + 0.05, seq, mint, uri, event, attempt))
+                                pending_ids.add(mint)
+                                inspected += 1
+                                continue
+                            inflight.add(mint)
+                            item = candidate
+                            fresh_count = fresh_count + 1 if attempt == 1 else 0
+                            break
+                        if item:
+                            break
             if not item:
                 time.sleep(0.15)
                 continue
@@ -459,12 +516,14 @@ def diagnostics():
     with lock:
         now=time.time(); samples=[result for ts,result in recent if now-ts<3600]
         counts={k:samples.count(k) for k in set(samples)}
-        s=state['stats']; q=len(pending); f=len(inflight)
+        s=state['stats']; q=queue_size(); f=len(inflight)
         return (f'🔬 <b>Detection diagnostics</b>\n'
                 f'WebSocket: {"connected" if connected else "disconnected"}\n'
                 f'Last launch: {int(now-last_event)}s ago\n' if last_event else '🔬 <b>Detection diagnostics</b>\nNo launches received this uptime\n') + (
                 f'Last metadata success: {int(now-last_success)}s ago\n' if last_success else 'No successful metadata fetch this uptime\n') + (
-                f'Pending: {q} | Active: {f}\n'
+                f'Pending: {q} (fresh {len(fresh_pending)}, retries {len(pending)}) | Active: {f}\n'
+                f'Oldest pending: {int(max((now-float(state["mints"].get(item[2], {}).get("seen_at", now)) for heap in (fresh_pending,pending) for item in heap), default=0))}s | Expired: {s.get("expired_checks",0)}\n'
+                f'Freshness limit: {MAX_QUEUE_AGE}s\n'
                 f'Rate limiter: {len(host_next)} hosts; {host_throttled} throttles; {cache_hits} cache hits\n'
                 f'Longest host wait: {max(0, int(max(host_next.values(), default=now)-now))}s\n'
                 f'Last hour: {len(samples)} checks; {counts.get("tiktok_found",0)} TikTok links; '
@@ -571,7 +630,7 @@ def monitor():
         time.sleep(60)
         now=time.time()
         with lock:
-            last=last_event; good=last_success; q=len(pending); s=state['stats'].copy()
+            last=last_event; good=last_success; q=queue_size(); s=state['stats'].copy()
         reasons=[]
         if now-start>600 and (not last or now-last>600): reasons.append('No launch events for 10 minutes')
         if now-start>600 and last and now-last<300 and (not good or now-good>600):
