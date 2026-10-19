@@ -160,7 +160,11 @@ def normalize_uri(raw):
     try:
         if not ipaddress.ip_address(host).is_global: return None
     except ValueError: pass
-    if parsed.port not in (None,443): return None
+    try:
+        if parsed.port not in (None, 443): return None
+    except ValueError:
+        LOG.warning('Skipping malformed metadata URL with invalid port')
+        return None
     return raw
 
 IPFS_GATEWAYS = ('https://ipfs.io/ipfs/', 'https://dweb.link/ipfs/',
@@ -687,9 +691,18 @@ class Health(BaseHTTPRequestHandler):
     def do_HEAD(self): self.send_response(200); self.end_headers()
     def log_message(self,*args): pass
 
+def scheduler_supervisor():
+    while True:
+        try:
+            scheduler()
+            LOG.error('Scheduler exited unexpectedly; restarting')
+        except Exception:
+            LOG.exception('Scheduler crashed; restarting after 2 seconds')
+        time.sleep(2)
+
 def main():
     threading.Thread(target=lambda:ThreadingHTTPServer(('0.0.0.0',PORT),Health).serve_forever(),daemon=True).start()
-    threading.Thread(target=scheduler,daemon=True).start()
+    threading.Thread(target=scheduler_supervisor,daemon=True).start()
     threading.Thread(target=command_loop,daemon=True).start()
     threading.Thread(target=monitor,daemon=True).start()
     url='wss://pumpportal.fun/api/data'
