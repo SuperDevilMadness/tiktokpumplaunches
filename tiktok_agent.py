@@ -14,9 +14,9 @@ HEARTBEAT_MINUTES = max(5, int(os.getenv('HEARTBEAT_MINUTES', '60')))
 WORKERS = max(1, min(8, int(os.getenv('METADATA_WORKERS', '3'))))
 HOST_INTERVAL = max(0.2, float(os.getenv('HOST_REQUEST_INTERVAL', '2.0')))
 GLOBAL_INTERVAL = max(0.1, float(os.getenv('GLOBAL_REQUEST_INTERVAL', '0.6')))
-MAX_ATTEMPTS = max(3, int(os.getenv('MAX_METADATA_ATTEMPTS', '8')))
-MAX_PENDING = max(1000, int(os.getenv('MAX_PENDING', '12000')))
-MAX_QUEUE_AGE = max(60, int(os.getenv('MAX_QUEUE_AGE_SECONDS', '900')))
+MAX_ATTEMPTS = max(1, int(os.getenv('MAX_METADATA_ATTEMPTS', '3')))
+MAX_PENDING = max(200, int(os.getenv('MAX_PENDING', '1500')))
+MAX_QUEUE_AGE = max(60, int(os.getenv('MAX_QUEUE_AGE_SECONDS', '300')))
 FRESH_BURST = max(1, int(os.getenv('FRESH_BURST', '5')))
 PUMPPORTAL_API_KEY = os.getenv('PUMPPORTAL_API_KEY', '').strip()
 DATA = os.getenv('DATA_DIR', '/data')
@@ -48,7 +48,7 @@ state = {
 DEFAULT_STATS = ('tokens_seen','metadata_ok','metadata_fail','metadata_404','metadata_429','metadata_403',
                  'metadata_other_http','metadata_missing_uri','tiktok_found','alerts_sent','alert_errors',
                  'pair_suppressed','ticker_suppressed','watch_hits','retries','queue_dropped','non_tiktok',
-                 'websocket_reconnects','checks_completed','expired_checks')
+                 'websocket_reconnects','checks_completed','expired_checks','queue_evicted','gateway_fallbacks')
 recent = deque(maxlen=10000)
 # These limits are intentionally shared across workers, including metadata retries.
 host_next = {}
@@ -163,6 +163,21 @@ def normalize_uri(raw):
     if parsed.port not in (None,443): return None
     return raw
 
+IPFS_GATEWAYS = ('https://ipfs.io/ipfs/', 'https://dweb.link/ipfs/',
+                 'https://gateway.pinata.cloud/ipfs/')
+
+def retry_uri(uri, attempt):
+    # Only rotate IPFS gateways for canonical IPFS paths; do not rewrite
+    # arbitrary third-party hosts. Preserve path and query.
+    parsed = urlparse(uri)
+    path = parsed.path
+    cid_path = None
+    if parsed.hostname in ('ipfs.io', 'dweb.link', 'gateway.pinata.cloud') and path.startswith('/ipfs/'):
+        cid_path = path[len('/ipfs/'):]
+    if cid_path and attempt > 1:
+        return IPFS_GATEWAYS[(attempt - 1) % len(IPFS_GATEWAYS)] + cid_path + (('?' + parsed.query) if parsed.query else '')
+    return uri
+
 def metadata_host(uri):
     normalized = normalize_uri(uri)
     return (urlparse(normalized).hostname or '').lower() if normalized else ''
@@ -185,7 +200,7 @@ def throttle_host(host, retry_after=None):
     with lock:
         strikes = min(8, host_strikes.get(host, 0) + 1)
         host_strikes[host] = strikes
-        backoff = min(900, 60 * 2 ** (strikes - 1)) + random.uniform(0, 5)
+        backoff = min(180, 15 * 2 ** (strikes - 1)) + random.uniform(0, 3)
         if retry_after is not None:
             try:
                 backoff = max(backoff, min(900, float(retry_after)))
@@ -308,8 +323,22 @@ def enqueue(mint, uri, event, attempt=1, delay=0):
             mark_expired(mint)
             return False
         if queue_size() >= MAX_PENDING:
-            inc('queue_dropped')
-            return False
+            # Prioritize new discoveries over old retries. Remove the oldest
+            # queued mint (not an active worker) so new launches aren't lost.
+            candidates = [(item[1], heap, idx, item[2])
+                          for heap in (pending, fresh_pending)
+                          for idx, item in enumerate(heap)]
+            if candidates:
+                _, victim_heap, victim_idx, victim_mint = min(candidates, key=lambda x: x[0])
+                victim_heap.pop(victim_idx)
+                heapq.heapify(victim_heap)
+                pending_ids.discard(victim_mint)
+                if victim_mint in state['mints']:
+                    state['mints'][victim_mint]['last_result'] = 'evicted_for_fresh_launch'
+                inc('queue_evicted')
+            else:
+                inc('queue_dropped')
+                return False
         sequence += 1
         item = (time.time() + delay, sequence, mint, uri, event, attempt)
         heapq.heappush(fresh_pending if attempt == 1 else pending, item)
@@ -382,7 +411,7 @@ def check(mint,uri,event,attempt):
         if mint_expired(mint):
             mark_expired(mint)
             return
-    meta,result=fetch_metadata(uri)
+    meta,result=fetch_metadata(retry_uri(uri, attempt))
     if meta is None:
         if result.startswith('deferred:'):
             with lock:
@@ -405,7 +434,7 @@ def check(mint,uri,event,attempt):
             with lock: inflight.discard(mint)
             # 429s are already handled by the host limiter. These delays also
             # spread other transient failures without blocking fresh launches.
-            delay = min(900, 12 * (2 ** (attempt - 1))) + random.uniform(0, 6)
+            delay = min(120, 10 * (2 ** (attempt - 1))) + random.uniform(0, 4)
             enqueue(mint, uri, event, attempt + 1, delay)
         return
     last_success=time.time()
@@ -445,7 +474,7 @@ def scheduler():
                                 mark_expired(mint)
                                 inspected += 1
                                 continue
-                            host = metadata_host(uri)
+                            host = metadata_host(retry_uri(uri, attempt))
                             ready = max(host_next.get(host, 0), global_next) if host else now
                             if ready > now:
                                 heapq.heappush(heap, (ready + 0.05, seq, mint, uri, event, attempt))
@@ -523,7 +552,7 @@ def diagnostics():
                 f'Last metadata success: {int(now-last_success)}s ago\n' if last_success else 'No successful metadata fetch this uptime\n') + (
                 f'Pending: {q} (fresh {len(fresh_pending)}, retries {len(pending)}) | Active: {f}\n'
                 f'Oldest pending: {int(max((now-float(state["mints"].get(item[2], {}).get("seen_at", now)) for heap in (fresh_pending,pending) for item in heap), default=0))}s | Expired: {s.get("expired_checks",0)}\n'
-                f'Freshness limit: {MAX_QUEUE_AGE}s\n'
+                f'Freshness limit: {MAX_QUEUE_AGE}s | Evicted: {s.get("queue_evicted",0)}\n'
                 f'Rate limiter: {len(host_next)} hosts; {host_throttled} throttles; {cache_hits} cache hits\n'
                 f'Longest host wait: {max(0, int(max(host_next.values(), default=now)-now))}s\n'
                 f'Last hour: {len(samples)} checks; {counts.get("tiktok_found",0)} TikTok links; '
